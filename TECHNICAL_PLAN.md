@@ -1,0 +1,136 @@
+# Social Media Image Automation — Technical Plan
+
+Automated daily pipeline: generate images with OpenAI API → post to Facebook Pages, orchestrated by GitHub Actions.
+
+## 1. Architecture Overview
+
+```
+cron (external: cron-job.org / Pipedream)
+        │  HTTP POST (workflow_dispatch)
+        ▼
+GitHub Actions ── schedules ──> keep-alive guard
+        │
+        ▼
+Python job (runs-on: ubuntu-latest)
+   ├─ 1. Read prompts.csv (name,prompt,request)
+   ├─ 2. Pick next unused prompt (state file)
+   ├─ 3. Call OpenAI gpt-image-2  (returns b64_json)
+   ├─ 4. Decode image -> post via FB Graph API /{page-id}/photos
+   ├─ 5. Mark prompt as used (commit state)
+   └─ 6. Log result (idempotency + audit)
+```
+
+## 2. Key Design Decisions
+
+### 2.1 Image generation — OpenAI `gpt-image-2`
+- Endpoint: `POST https://api.openai.com/v1/images/generations`
+- Model: `gpt-image-2`, `size: 1024x1024`, `quality: medium` (default), `response_format: b64_json`
+- **`b64_json` is critical**: FB can ingest raw bytes via `source` upload. No public URL, no object storage needed. (DALL·E returned expiring URLs; gpt-image returns b64.)
+- Cost/mo at 300 images (1024x1024): low ~$1.80, medium ~$15.90, high ~$63.30.
+
+### 2.2 Facebook posting — Graph API
+- Endpoint: `POST https://graph.facebook.com/v21.0/{page_id}/photos`
+  - `source` = multipart file upload (image bytes), `message` = caption, `access_token` = System User token.
+- **Use a System User token** (Business Manager). User access tokens expire after 60 days; System User tokens are long-lived and survive the GitHub Actions 60-day inactivity trap.
+- Permission: `pages_manage_posts` (+ `pages_show_list`, `pages_read_engagement` for listing pages).
+
+### 2.3 Orchestration — GitHub Actions
+- Free tier: 2,000 min/mo (job ~2-3 min/day ≈ 60-90 min/mo, well within limits).
+- **60-day inactivity policy**: GitHub silently disables scheduled workflows after ~60 days without a commit on the default branch. Two mitigation options (use BOTH):
+  1. External trigger: cron-job.org (free, 5-min interval) → `POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches` with `github-token`. This is the reliable primary trigger.
+  2. Keep-alive workflow: a second scheduled workflow that commits a timestamp to `state/keepalive.txt` — keeps the repo "active" so the main `schedule:` cron also keeps working.
+- Cron in GitHub Actions is UTC. Set run time accordingly (e.g., `0 0 * * *` = midnight UTC).
+- Add `concurrency: group: daily-poster, cancel-in-progress: true` so two runs never overlap.
+- Random `sleep 0-300s` at start of job to avoid a machine-like fixed pattern (safer for FB rate limits).
+
+### 2.3 Instagram posting (Graph API, 2-step)
+Instagram **cannot** accept raw image bytes — it requires a **public image URL** (unlike FB's `source` upload). This is the key extra dependency vs FB-only.
+
+- Prereqs: IG account must be **Professional (Business/Creator)** and **linked to a FB Page**.
+- Resolve `ig_user_id`: `GET /{page_id}?fields=instagram_business_account`
+- Step 1 — Create container: `POST /{ig_user_id}/media` with `image_url=<public URL>` + `caption` → returns `creation_id`
+- Step 2 — Publish: `POST /{ig_user_id}/media_publish` with `creation_id` → returns published `id`
+- Permissions (System User token): add `instagram_content_publish` (keep `pages_manage_posts`).
+- **Storage: use GitHub raw URLs (no R2 needed).** Commit each image to the repo (`images/<name>.png`) and use `https://raw.githubusercontent.com/<owner>/<repo>/main/images/<name>.png` as the permanent public URL for IG. Requirements: **public repo**, commit+push before the IG container call (URL must exist at publish time). Trade-offs: repo must be public (acceptable — content is public social posts), negligible bloat at image sizes.
+- Posting flow per run: generate image → save to `images/` → commit+push → publish to FB via `source` → create+publish IG container with the raw URL.
+
+> **Note on crossposting:** Meta Business Suite has a UI "Share to Instagram" toggle and personal "Sharing across profiles" in Accounts Center. This is a **manual per-post toggle only** — there is no Graph API parameter to crosspost an API-created post, and the old automatic Page→Instagram auto-share was removed. Automated posting must use the 2-step container flow above.
+
+### 2.4 State & idempotency (no persistent DB)
+- GitHub Actions has no persistent state. Keep it in-repo:
+  - `state/used_prompts.json` — list of prompt names already posted (committed after each run).
+  - `state/keepalive.txt` — timestamp for inactivity guard.
+  - `logs/posts.csv` — audit log (name, prompt, image_id, post_id, timestamp, page_id).
+- Job must `git pull` before reading state and `git commit --push` after writing to avoid lost updates. Since only one job runs at a time (concurrency guard), this is safe.
+
+## 3. Repository Layout (inside D:\social-media-image-gen)
+
+```
+opencode.json
+prompts.csv                      # source: name,prompt,request (generated by prompt-engineer agent)
+.github/
+  workflows/
+    daily-poster.yml             # main job (triggered by external cron + schedule)
+    keepalive.yml                # keep repo active
+scripts/
+  post_images.py                 # single job: read state, gen image, post to FB, update state
+  config.py                      # page list, scheduling, paths
+  requirements.txt               # openai, requests
+state/
+  used_prompts.json              # committed
+  keepalive.txt
+logs/
+  posts.csv
+```
+
+## 4. Secrets (GitHub → Settings → Secrets and variables → Actions)
+
+| Secret | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | Image generation |
+| `FB_SYSTEM_USER_TOKEN` | Long-lived System User access token |
+| `FB_PAGE_IDS` | JSON array of page IDs to post to |
+| `FB_PAGE_CAPTION` | Optional default caption template |
+| `GITHUB_REPO` | `owner/repo` (public) — used to build the raw image URL for IG |
+
+## 5. Daily Flow (per run)
+
+1. `sleep $(shuf -i 0-300 -n1)` — stagger.
+2. Read `prompts.csv` + `state/used_prompts.json`; pick first unused prompt.
+3. Call OpenAI; get b64 image.
+4. Save to `images/<name>.png`, commit + push (also updates state).
+5. Build IG image URL: `https://raw.githubusercontent.com/{owner}/{repo}/main/images/{name}.png`
+6. **Facebook:** `POST /{page_id}/photos` with `source` (raw bytes) for each page in `FB_PAGE_IDS`.
+7. **Instagram (if enabled):** `POST /{ig_user_id}/media` (container) → `POST /{ig_user_id}/media_publish` for each linked IG account.
+8. Append to `logs/posts.csv`; mark prompt used; commit + push.
+9. On any failure: fail the job (visible in Actions UI), do NOT mark prompt used (so it retries next day).
+
+## 6. Implementation Phases
+
+1. **Phase 1 — Manual proof** (no scheduling): local Python script. Generate 1 image, post to 1 page. Verify System User token + permissions work.
+2. **Phase 2 — Single scheduled job**: GitHub Actions workflow + secrets + state commit. Run daily on 1 page.
+3. **Phase 3 — Full scale**: loop over all 5 pages, keep-alive workflow, external cron trigger, monitoring (notify on failure).
+
+## 7. Gotchas Checklist
+
+- [ ] System User token, not user token (60-day expiry).
+- [ ] App must be in Live mode / Advanced Access for `pages_manage_posts`.
+- [ ] Keep GitHub Actions timezone UTC in mind.
+- [ ] Concurrency guard present.
+- [ ] Random sleep to avoid fixed posting patterns.
+- [ ] External cron (cron-job.org) as primary trigger; keep-alive as backup.
+- [ ] `b64_json` (not URL) — avoids storage + URL-expiry entirely.
+- [ ] IG requires a **public permanent URL** — solved with GitHub raw URL on a **public repo** (signed/short-lived URLs fail).
+- [ ] Commit+push the image **before** the IG container call, so the raw URL resolves at publish time.
+- [ ] IG account must be Professional and linked to the FB Page; token needs `instagram_content_publish`.
+- [ ] Idempotency: never reuse a prompt; commit state after success only.
+
+## 8. Cost Estimate (OpenAI only, 300 images/mo, 1024x1024)
+
+| Quality | Per image | Monthly (300) |
+|---|---|---|
+| low | $0.006 | ~$1.80 |
+| medium | $0.053 | ~$15.90 |
+| high | $0.211 | ~$63.30 |
+
+GitHub Actions: free tier. cron-job.org: free tier.
