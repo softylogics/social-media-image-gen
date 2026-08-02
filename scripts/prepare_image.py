@@ -20,13 +20,13 @@ def main():
     image_name = os.environ.get("IMAGE_NAME", f"post_{int(time.time())}.png")
     local_path = os.path.join("images", image_name)
     os.makedirs("images", exist_ok=True)
-    src = os.environ.get("IMAGE_URL", EXAMPLE_IMAGE_URLS[0])
+    src = os.environ.get("IMAGE_URL") or EXAMPLE_IMAGE_URLS[0]
+    caption = os.environ.get("CAPTION") or "Test post from GitHub Actions automation pipeline"
     download_image(src, local_path)
     with open("state/pending_post.json", "w") as f:
         json.dump(
             {"image_name": image_name, "image_url": src,
-             "caption": os.environ.get(
-                 "CAPTION", "Test post from GitHub Actions automation pipeline"),
+             "caption": caption,
              "timestamp": int(time.time())},
             f, indent=2)
     print(f"Downloaded {src} -> {local_path}")
