@@ -1,0 +1,45 @@
+name: daily-poster
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-poster
+  cancel-in-progress: true
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Download example image
+        env:
+          IMAGE_URL: ${{ github.event.inputs.image_url }}
+          CAPTION: ${{ github.event.inputs.caption }}
+        run: python scripts/prepare_image.py
+
+      - name: Commit image
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add images state
+          git commit -m "Add image for daily post" || echo "nothing to commit"
+          git push
+
+      - name: Post to Facebook and Instagram
+        env:
+          FB_SYSTEM_USER_TOKEN: ${{ secrets.FB_SYSTEM_USER_TOKEN }}
+        run: python scripts/post_fb_ig.py
